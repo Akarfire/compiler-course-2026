@@ -1,0 +1,112 @@
+# RUN: llc -mtriple x86_64-unknown-linux-gnu --load=%llvmshlibdir/kutuzov_i_lab_3_BACKEND%shlibext \
+# RUN:   -run-pass=kutuzov_inline-x86 %s -o - | FileCheck %s
+
+--- |
+  define i32 @too_big_func(i32 %x) {
+    %1 = mul i32 %x, 1
+    %2 = mul i32 %1, 2
+    %3 = mul i32 %2, 3
+    %4 = mul i32 %3, 4
+    %5 = mul i32 %4, 5
+    %6 = mul i32 %5, 6
+    %7 = mul i32 %6, 7
+    %8 = mul i32 %7, 8
+    %9 = mul i32 %8, 9
+    %10 = mul i32 %9, 10
+    %11 = mul i32 %10, 11
+    %12 = mul i32 %11, 12
+    %13 = mul i32 %12, 13
+    %14 = mul i32 %13, 14
+    %15 = mul i32 %14, 15
+    %16 = mul i32 %15, 16
+    ret i32 %16
+  }
+
+  define i32 @sum_func(i32 %a, i32 %b) {
+    %sum = add i32 %a, %b
+    ret i32 %sum
+  }
+
+  define i32 @small_func(i32 %x) {
+    %a = add i32 %x, 1
+    %b = add i32 %a, 2
+    %c = add i32 %b, 3
+    ret i32 %c
+  }
+
+  define i32 @recursive_func(i32 %n) {
+    %cmp = icmp sle i32 %n, 1
+    br i1 %cmp, label %end, label %rec
+  end:
+    ret i32 1
+  rec:
+    %sub = sub i32 %n, 1
+    %call = call i32 @recursive_func(i32 %sub)
+    %mul = mul i32 %n, %call
+    ret i32 %mul
+  }
+
+  define i32 @main() {
+    %r1 = call i32 @sum_func(i32 12, i32 34)
+    %r2 = call i32 @small_func(i32 5)
+    %r3 = call i32 @too_big_func(i32 7)
+    %r4 = call i32 @recursive_func(i32 6)
+
+    %res = add i32 %r1, %r2
+    %res2 = add i32 %res, %r3
+    %final = add i32 %res2, %r4
+    ret i32 %final
+  }
+
+...
+# CHECK-LABEL: name: main
+name: main
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK: %0:gr32 = MOV32ri 6
+    ; CHECK: CALL64pcrel32 @recursive_func
+    ; CHECK: %1:gr32 = COPY $eax
+
+    ; CHECK: %2:gr32 = MOV32ri 7
+    ; CHECK: CALL64pcrel32 @too_big_func
+    ; CHECK: %3:gr32 = COPY $eax
+
+    ; CHECK: %4:gr32 = MOV32ri 12
+    ; CHECK: %5:gr32 = MOV32ri 34
+    ; CHECK: %6:gr32 = ADD32rr %4, %5, implicit-def dead $eflags
+
+    ; CHECK: %7:gr32 = MOV32ri 5
+    ; CHECK: %8:gr32 = ADD32ri %7, 1, implicit-def dead $eflags
+    ; CHECK: %9:gr32 = ADD32ri %8, 2, implicit-def dead $eflags
+    ; CHECK: %10:gr32 = ADD32ri %9, 3, implicit-def dead $eflags
+
+    %0:gr32 = MOV32ri 6
+    CALL64pcrel32 @recursive_func, csr_64, implicit $sp, implicit $ssp, implicit-def $eax
+    %1:gr32 = COPY $eax
+
+    %2:gr32 = MOV32ri 7
+    CALL64pcrel32 @too_big_func, csr_64, implicit $sp, implicit $ssp, implicit-def $eax
+    %3:gr32 = COPY $eax
+
+    %4:gr32 = MOV32ri 12
+    %5:gr32 = MOV32ri 34
+    %6:gr32 = ADD32rr %4, %5, implicit-def dead $eflags
+
+    %7:gr32 = MOV32ri 5
+    %8:gr32 = ADD32ri %7, 1, implicit-def dead $eflags
+    %9:gr32 = ADD32ri %8, 2, implicit-def dead $eflags
+    %10:gr32 = ADD32ri %9, 3, implicit-def dead $eflags
+
+    ; CHECK: %11:gr32 = ADD32rr %6, %10, implicit-def dead $eflags
+    ; CHECK: %12:gr32 = ADD32rr %11, %3, implicit-def dead $eflags
+    ; CHECK: %13:gr32 = ADD32rr %12, %1, implicit-def dead $eflags
+    ; CHECK: $eax = COPY %13
+
+    %11:gr32 = ADD32rr %6, %10, implicit-def dead $eflags
+    %12:gr32 = ADD32rr %11, %3, implicit-def dead $eflags
+    %13:gr32 = ADD32rr %12, %1, implicit-def dead $eflags
+    $eax = COPY %13
+    RET 0, $eax
+
+    
