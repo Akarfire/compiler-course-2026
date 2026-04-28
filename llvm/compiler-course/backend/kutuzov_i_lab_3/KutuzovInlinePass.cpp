@@ -108,7 +108,7 @@ public:
       int recursionDepth = 0;
 
       for (auto &MBB : MF) {
-        for (auto it = MBB.begin(); it != MBB.end(); ) {
+        for (auto it = MBB.begin(); it != MBB.end();) {
           MachineInstr &MI = *it++;
           if (MI.getOpcode() == X86::CALL64pcrel32) {
             if (tryInline(MF, MBB, MI, recursionDepth)) {
