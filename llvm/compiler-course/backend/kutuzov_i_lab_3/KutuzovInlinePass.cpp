@@ -24,7 +24,8 @@ static const char *MetaDataKey = "kutuzov.recursion_depth";
 static int getRecursionDepth(CallInst *call_instruction) {
   if (MDNode *metadata = call_instruction->getMetadata(MetaDataKey)) {
     if (metadata->getNumOperands() == 1) {
-      const auto *extract = mdconst::extract<ConstantInt>(metadata->getOperand(0));
+      const auto *extract =
+          mdconst::extract<ConstantInt>(metadata->getOperand(0));
       return extract->getZExtValue();
     }
   }
@@ -33,8 +34,9 @@ static int getRecursionDepth(CallInst *call_instruction) {
 
 static void setRecursionDepth(CallInst *call_instruction, int depth) {
   LLVMContext &context = call_instruction->getContext();
-  MDNode *metadata = MDNode::get(context, ConstantAsMetadata::get(
-                                   ConstantInt::get(Type::getInt32Ty(context), depth)));
+  MDNode *metadata =
+      MDNode::get(context, ConstantAsMetadata::get(ConstantInt::get(
+                               Type::getInt32Ty(context), depth)));
   call_instruction->setMetadata(MetaDataKey, metadata);
 }
 
@@ -54,7 +56,8 @@ class KutuzovInlinePass : public PassInfoMixin<KutuzovInlinePass> {
     return true;
   }
 
-  bool performInline(Function &caller, CallInst *call_instruction, Function &called_func) {
+  bool performInline(Function &caller, CallInst *call_instruction,
+                     Function &called_func) {
     BasicBlock &called_entry_block = called_func.getEntryBlock();
 
     if (called_func.size() != 1)
@@ -74,7 +77,8 @@ class KutuzovInlinePass : public PassInfoMixin<KutuzovInlinePass> {
       if (instruction.isTerminator())
         continue;
       Instruction *cloned_instruction = instruction.clone();
-      for (int Op = 0, E = cloned_instruction->getNumOperands(); Op != E; ++Op) {
+      for (int Op = 0, E = cloned_instruction->getNumOperands(); Op != E;
+           ++Op) {
         Value *OpV = cloned_instruction->getOperand(Op);
         if (OpV && arg_map.count(OpV))
           cloned_instruction->setOperand(Op, arg_map[OpV]);
@@ -85,15 +89,18 @@ class KutuzovInlinePass : public PassInfoMixin<KutuzovInlinePass> {
 
     if (Value *return_value = ret->getReturnValue()) {
       Value *mapped_return_value = arg_map.lookup(return_value);
-      call_instruction->replaceAllUsesWith(mapped_return_value ? mapped_return_value : return_value);
+      call_instruction->replaceAllUsesWith(
+          mapped_return_value ? mapped_return_value : return_value);
     } else {
-      call_instruction->replaceAllUsesWith(UndefValue::get(call_instruction->getType()));
+      call_instruction->replaceAllUsesWith(
+          UndefValue::get(call_instruction->getType()));
     }
 
     int depth = getRecursionDepth(call_instruction);
     for (Instruction &I : *caller_block) {
       auto *Newcall_instruction = dyn_cast<CallInst>(&I);
-      if (Newcall_instruction && Newcall_instruction->getCalledFunction() == &called_func) {
+      if (Newcall_instruction &&
+          Newcall_instruction->getCalledFunction() == &called_func) {
         setRecursionDepth(Newcall_instruction, depth + 1);
       }
     }
@@ -144,7 +151,8 @@ class KutuzovInlinePass : public PassInfoMixin<KutuzovInlinePass> {
   }
 
 public:
-  PreservedAnalyses run(Module &module, ModuleAnalysisManager &analyis_manager) {
+  PreservedAnalyses run(Module &module,
+                        ModuleAnalysisManager &analyis_manager) {
     if (!runImpl(module))
       return PreservedAnalyses::all();
     return PreservedAnalyses::none();
