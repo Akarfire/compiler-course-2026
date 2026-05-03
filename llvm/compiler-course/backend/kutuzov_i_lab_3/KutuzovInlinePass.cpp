@@ -1,181 +1,183 @@
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/IR/BasicBlock.h"
-#include "llvm/IR/Constants.h"
-#include "llvm/IR/DebugInfoMetadata.h"
-#include "llvm/IR/DerivedTypes.h"
-#include "llvm/IR/Function.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/IntrinsicInst.h"
-#include "llvm/IR/Metadata.h"
+#include "X86.h"
+#include "X86InstrInfo.h"
+#include "X86Subtarget.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/MachineModuleInfo.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IR/ValueMap.h"
 #include "llvm/Pass.h"
-#include "llvm/Passes/PassBuilder.h"
-#include "llvm/Passes/PassPlugin.h"
-#include "llvm/Support/raw_ostream.h"
+#include <map>
+#include <set>
 
 using namespace llvm;
 
 namespace {
 
-static const char *MetaDataKey = "kutuzov.recursion_depth";
-
-static int getRecursionDepth(CallInst *call_instruction) {
-  if (MDNode *metadata = call_instruction->getMetadata(MetaDataKey)) {
-    if (metadata->getNumOperands() == 1) {
-      const auto *extract =
-          mdconst::extract<ConstantInt>(metadata->getOperand(0));
-      return extract->getZExtValue();
-    }
-  }
-  return 0;
-}
-
-static void setRecursionDepth(CallInst *call_instruction, int depth) {
-  LLVMContext &context = call_instruction->getContext();
-  MDNode *metadata =
-      MDNode::get(context, ConstantAsMetadata::get(ConstantInt::get(
-                               Type::getInt32Ty(context), depth)));
-  call_instruction->setMetadata(MetaDataKey, metadata);
-}
-
-class KutuzovInlinePass : public PassInfoMixin<KutuzovInlinePass> {
+class KutuzovInlinePass : public ModulePass {
   static const int MAX_INSTRUCTIONS = 15;
   static const int MAX_RECURSION_DEPTH = 3;
 
-  bool canInline(Function &func) const {
-    int num_instructions = 0;
-    for (BasicBlock &block : func)
-      for (Instruction &instruction : block) {
-        if (instruction.isTerminator() || isa<DbgInfoIntrinsic>(instruction))
-          continue;
-        if (++num_instructions > MAX_INSTRUCTIONS)
-          return false;
-      }
-    return true;
-  }
-
-  bool performInline(Function &caller, CallInst *call_instruction,
-                     Function &called_func) {
-    BasicBlock &called_entry_block = called_func.getEntryBlock();
-
-    if (called_func.size() != 1)
-      return false;
-    ReturnInst *ret = dyn_cast<ReturnInst>(called_entry_block.getTerminator());
-    if (!ret)
-      return false;
-
-    ValueMap<const Value *, Value *> arg_map;
-    int arg_index = 0;
-    for (Argument &arg : called_func.args())
-      arg_map[&arg] = call_instruction->getArgOperand(arg_index++);
-
-    IRBuilder<> builder(call_instruction);
-    BasicBlock *caller_block = call_instruction->getParent();
-    for (Instruction &instruction : called_entry_block) {
-      if (instruction.isTerminator())
-        continue;
-      Instruction *cloned_instruction = instruction.clone();
-      for (int Op = 0, E = cloned_instruction->getNumOperands(); Op != E;
-           ++Op) {
-        Value *OpV = cloned_instruction->getOperand(Op);
-        if (OpV && arg_map.count(OpV))
-          cloned_instruction->setOperand(Op, arg_map[OpV]);
-      }
-      builder.Insert(cloned_instruction);
-      arg_map[&instruction] = cloned_instruction;
-    }
-
-    if (Value *return_value = ret->getReturnValue()) {
-      Value *mapped_return_value = arg_map.lookup(return_value);
-      call_instruction->replaceAllUsesWith(
-          mapped_return_value ? mapped_return_value : return_value);
-    } else {
-      call_instruction->replaceAllUsesWith(
-          UndefValue::get(call_instruction->getType()));
-    }
-
-    int depth = getRecursionDepth(call_instruction);
-    for (Instruction &I : *caller_block) {
-      auto *Newcall_instruction = dyn_cast<CallInst>(&I);
-      if (Newcall_instruction &&
-          Newcall_instruction->getCalledFunction() == &called_func) {
-        setRecursionDepth(Newcall_instruction, depth + 1);
-      }
-    }
-
-    call_instruction->eraseFromParent();
-    return true;
-  }
-
-  bool runImpl(Module &module) {
-    bool changed = false;
-
-    for (Function &func : module) {
-      if (func.isDeclaration())
-        continue;
-
-      bool local_changed;
-      do {
-        local_changed = false;
-        for (BasicBlock &block : func) {
-          for (auto instr = block.begin(); instr != block.end();) {
-            Instruction *instruction = &*instr++;
-            auto *call_instruction = dyn_cast<CallInst>(instruction);
-            if (!call_instruction)
-              continue;
-
-            Function *called_func = call_instruction->getCalledFunction();
-            if (!called_func || called_func->isDeclaration())
-              continue;
-
-            if (getRecursionDepth(call_instruction) >= MAX_RECURSION_DEPTH)
-              continue;
-
-            if (!canInline(*called_func))
-              continue;
-
-            if (performInline(func, call_instruction, *called_func)) {
-              local_changed = true;
-              changed = true;
-              break;
-            }
-          }
-          if (local_changed)
-            break;
-        }
-      } while (local_changed);
-    }
-    return changed;
-  }
-
 public:
-  PreservedAnalyses run(Module &module,
-                        ModuleAnalysisManager &analyis_manager) {
-    if (!runImpl(module))
-      return PreservedAnalyses::all();
-    return PreservedAnalyses::none();
+  static char ID;
+  KutuzovInlinePass() : ModulePass(ID) {}
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<MachineModuleInfoWrapperPass>();
+    ModulePass::getAnalysisUsage(AU);
   }
+
+  StringRef getPassName() const override { return "kutuzov_inline-x86"; }
+  bool runOnModule(Module &M) override;
+
+private:
+  int countInstructions(const MachineFunction &MF) const;
+  bool hasCalls(const MachineFunction &MF) const;
+  bool tryInline(MachineFunction &Caller, MachineBasicBlock &MBB,
+                 MachineInstr &CallMI, int &Depth, MachineModuleInfo &MMI,
+                 std::set<const Function *> &LocalBlacklist);
 };
+
+char KutuzovInlinePass::ID = 0;
+
+bool KutuzovInlinePass::runOnModule(Module &M) {
+  MachineModuleInfo &MMI = getAnalysis<MachineModuleInfoWrapperPass>().getMMI();
+  bool Changed = false;
+
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+
+    MachineFunction *MF = MMI.getMachineFunction(F);
+    if (!MF)
+      continue;
+
+    std::set<const Function *> LocalBlacklist;
+    int Depth = 0;
+    bool LocalChange = true;
+
+    while (LocalChange) {
+      LocalChange = false;
+
+      for (MachineBasicBlock &MBB : *MF) {
+        for (auto MI = MBB.begin(); MI != MBB.end();) {
+          MachineInstr &Ins = *MI++;
+
+          if (Ins.getOpcode() != X86::CALL64pcrel32)
+            continue;
+
+          MachineOperand &Op = Ins.getOperand(0);
+          if (!Op.isGlobal())
+            continue;
+          const Function *CalleeF = dyn_cast<Function>(Op.getGlobal());
+          if (!CalleeF)
+            continue;
+
+          if (LocalBlacklist.count(CalleeF))
+            continue;
+
+          if (tryInline(*MF, MBB, Ins, Depth, MMI, LocalBlacklist)) {
+            LocalChange = true;
+            Changed = true;
+            break;
+          }
+        }
+        if (LocalChange)
+          break;
+      }
+    }
+  }
+  return Changed;
+}
+
+int KutuzovInlinePass::countInstructions(const MachineFunction &MF) const {
+  int Count = 0;
+  for (const MachineBasicBlock &MBB : MF) {
+    for (const MachineInstr &MI : MBB) {
+      if (!MI.isDebugInstr() && !MI.isMetaInstruction())
+        ++Count;
+    }
+  }
+  return Count;
+}
+
+bool KutuzovInlinePass::hasCalls(const MachineFunction &MF) const {
+  for (const MachineBasicBlock &MBB : MF) {
+    for (const MachineInstr &MI : MBB) {
+      if (MI.isCall())
+        return true;
+    }
+  }
+  return false;
+}
+
+bool KutuzovInlinePass::tryInline(MachineFunction &Caller,
+                                  MachineBasicBlock &MBB, MachineInstr &CallMI,
+                                  int &Depth, MachineModuleInfo &MMI,
+                                  std::set<const Function *> &LocalBlacklist) {
+  MachineOperand &Op = CallMI.getOperand(0);
+  const Function *CalleeF = cast<Function>(Op.getGlobal());
+  MachineFunction *CalleeMF = nullptr;
+
+  if (CalleeF == &Caller.getFunction()) {
+    if (Depth >= MAX_RECURSION_DEPTH)
+      return false;
+    ++Depth;
+    CalleeMF = &Caller;
+  } else {
+    CalleeMF = MMI.getMachineFunction(*CalleeF);
+    if (!CalleeMF)
+      return false;
+  }
+
+  if (countInstructions(*CalleeMF) > MAX_INSTRUCTIONS)
+    return false;
+
+  MachineRegisterInfo &CallerMRI = Caller.getRegInfo();
+  MachineRegisterInfo &CalleeMRI = CalleeMF->getRegInfo();
+
+  std::map<Register, Register> VRegMap;
+  SmallVector<MachineInstr *, 16> ToClone;
+
+  for (MachineInstr &MI : CalleeMF->front()) {
+    if (MI.isReturn())
+      continue;
+    ToClone.push_back(&MI);
+  }
+
+  for (MachineInstr *MI : ToClone) {
+    for (MachineOperand &MO : MI->operands()) {
+      if (MO.isReg() && MO.getReg().isVirtual()) {
+        Register Reg = MO.getReg();
+        if (!VRegMap.count(Reg)) {
+          const TargetRegisterClass *RC = CalleeMRI.getRegClass(Reg);
+          VRegMap[Reg] = CallerMRI.createVirtualRegister(RC);
+        }
+      }
+    }
+  }
+
+  MachineBasicBlock::iterator InsertPt = CallMI.getIterator();
+  for (MachineInstr *Orig : ToClone) {
+    MachineInstr *Clone = Caller.CloneMachineInstr(Orig);
+    for (MachineOperand &MO : Clone->operands()) {
+      if (MO.isReg() && MO.getReg().isVirtual()) {
+        auto It = VRegMap.find(MO.getReg());
+        if (It != VRegMap.end())
+          MO.setReg(It->second);
+      }
+    }
+    MBB.insert(InsertPt, Clone);
+  }
+
+  if (CalleeF != &Caller.getFunction() && hasCalls(*CalleeMF))
+    LocalBlacklist.insert(CalleeF);
+
+  CallMI.eraseFromParent();
+  return true;
+}
 
 } // namespace
 
-PassPluginLibraryInfo getKutuzovInlinePluginInfo() {
-  return {LLVM_PLUGIN_API_VERSION, "kutuzov_inline-x86", LLVM_VERSION_STRING,
-          [](PassBuilder &PB) {
-            PB.registerPipelineParsingCallback(
-                [](StringRef Name, ModulePassManager &MPM,
-                   ArrayRef<PassBuilder::PipelineElement>) {
-                  if (Name == "kutuzov_inline-x86") {
-                    MPM.addPass(KutuzovInlinePass());
-                    return true;
-                  }
-                  return false;
-                });
-          }};
-}
-
-extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
-  return getKutuzovInlinePluginInfo();
-}
+static RegisterPass<KutuzovInlinePass> X("kutuzov_inline-x86",
+                                         "kutuzov_inline-x86", false, false);
